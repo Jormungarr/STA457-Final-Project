@@ -1,0 +1,629 @@
+---
+title: "STA457 Final Project"
+author: "GROUP"
+format: pdf
+editor: visual
+---
+
+# Package & Data
+
+```{r, include=FALSE}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(zoo)
+library(xts)
+library(astsa)
+library(tseries)
+library(urca)
+library(forecast)
+library(Metrics)
+library(parallel)
+library(rugarch)
+library(mgcv)
+library(xgboost)
+library(Matrix)
+library(caret)
+library(kableExtra)
+set.seed(457)
+```
+
+```{r, warning=FALSE}
+cocoa_prices = read.csv("Daily Prices_ICCO.csv",stringsAsFactors = FALSE)
+cocoa_prices$Date = as.Date(cocoa_prices$Date, format = '%d/%m/%Y') 
+cocoa_prices$Price = as.numeric(gsub(",","",cocoa_prices$ICCO.daily.price..US..tonne.))
+
+cocoa_prices = cocoa_prices %>% select(Date, Price) %>% arrange(Date)
+
+cocoa_prices = cocoa_prices %>%
+  distinct(Date, .keep_all = TRUE)
+
+ghana_weather <- read.csv("Ghana_data.csv", stringsAsFactors = FALSE)
+ghana_weather$DATE <- as.Date(ghana_weather$DATE)
+ghana_weather <- ghana_weather %>%
+  group_by(DATE) %>%
+  summarise(across(c(PRCP, TAVG), mean, na.rm = FALSE))
+
+ghana_weather$PRCP[is.na(ghana_weather$PRCP)] <- 0
+
+cocoa_data = inner_join(cocoa_prices, ghana_weather, by = c("Date" = "DATE"))
+```
+
+## EDA
+
+```{r}
+cocoa_data_month = cocoa_data %>%
+  mutate(month = floor_date(Date, "month")) %>%
+  group_by(month) %>%
+  summarise(TAVG = mean(TAVG),
+            PRCP = mean(PRCP),
+            PRICE = mean(Price))
+
+cocoa_price_month_ts = ts(cocoa_data_month$PRICE, start = c(1994, 10), frequency = 12)
+
+png("fig1.1.png", width = 600, height = 400)
+plot(cocoa_price_month_ts, 
+     xlab = "Time",
+     ylab = "Price",
+     main = "Original Monthly Price",
+     col = "blue")
+dev.off()
+
+fig = acf2(cocoa_price_month_ts)
+
+ghana_prcp_month_ts = ts(cocoa_data_month$PRCP, start = c(1994, 10), frequency = 12)
+plot(ghana_prcp_month_ts)
+fig = acf2(ghana_prcp_month_ts)
+
+ghana_tavg_month_ts = ts(cocoa_data_month$TAVG, start = c(1994, 10), frequency = 12)
+plot(ghana_tavg_month_ts)
+fig = acf2(ghana_tavg_month_ts)
+```
+
+```{r}
+cocoa_price_ts = ts(cocoa_data_month$PRICE, start = c(1994, 10), frequency = 12)
+plot(cocoa_price_ts)
+fig = acf2(cocoa_price_ts)
+
+diff_fo = diff(cocoa_price_ts)
+plot(diff_fo)
+
+png("fig1.2.png", width = 600, height = 400)
+fig = acf2(diff_fo, main = "Differenced price")
+dev.off()
+
+cocoa_data_month$LOGP = log(cocoa_data_month$PRICE)
+```
+
+# Model
+
+## Future Data
+
+```{r}
+future_data = read.csv("Daily Prices_Home_NEW.csv")
+future_data$London.futures....sterling.tonne. = NULL
+future_data$New.York.futures..US..tonne. = NULL
+future_data$ICCO.daily.price..Euro.tonne. = NULL
+future_data$Date = as.Date(future_data$Date, format = '%d/%m/%Y')
+future_data = future_data %>% 
+  rename(Price = ICCO.daily.price..US..tonne.)
+future_data = future_data %>%
+  arrange(Date)
+future_data$Price = as.numeric(gsub(",", "", future_data$Price))
+future_data = future_data %>% filter(Date > as.Date("2024-12-01"))
+future_data = future_data %>% mutate(log_price = log(Price))
+
+future_month_data = future_data %>% 
+  mutate(month = floor_date(Date, "month")) %>%
+  group_by(month) %>%
+  summarise(Price = mean(Price),
+            log_price = log(mean(Price)))
+
+future_month_data = head(future_month_data, -1)
+
+future_whether = read.csv("newwhether.csv")
+future_whether$TAVG = future_whether$TAVG..Degrees.Fahrenheit.
+future_whether$PRCP = future_whether$PRCP..Inches.
+future_whether$TAVG..Degrees.Fahrenheit. = NULL
+future_whether$TMAX..Degrees.Fahrenheit. = NULL
+future_whether$TMIN..Degrees.Fahrenheit. = NULL
+future_whether$SNOW..Inches. = NULL
+future_whether$SNWD..Inches. = NULL
+future_whether$PRCP..Inches. = NULL
+future_whether$Date = as.Date(future_whether$Date, format = '%Y/%m/%d')
+future_whether <- future_whether %>%
+  filter(Date > as.POSIXct("2024-12-01"))
+
+future_whether$PRCP[is.na(future_whether$PRCP)] <- 0
+
+future_whether = future_whether %>%
+  mutate(month = floor_date(Date, "month"))
+
+future_whether$Date = NULL
+
+dec = future_whether %>% filter(month(month) == 12, !is.na(future_whether$TAVG))
+
+future_whether$TAVG[is.na(future_whether$TAVG)] = mean(dec$TAVG)
+
+future_whether = future_whether %>% 
+  group_by(month) %>% 
+  summarise(TAVG = mean(TAVG),
+            PRCP = mean(PRCP))
+
+cocoa_future_data = inner_join(future_month_data, future_whether, by = "month")
+actual_price = cocoa_future_data$Price
+```
+
+## SARIMA/SARIMAX
+
+```{r, message=FALSE}
+# ARIMA
+arima_model1 = sarima(cocoa_price_ts, 3, 1, 3)
+arima_model2 = sarima(cocoa_price_ts, 3, 1, 0)
+arima_model3 = sarima(cocoa_price_ts, 0, 1, 3)
+
+aic1 = arima_model1$ICs["AIC"]
+aic2 = arima_model2$ICs["AIC"]
+aic3 = arima_model2$ICs["AIC"]
+
+arima_model = Arima(cocoa_price_ts, order = c(3,1,3))
+fit_values <- fitted(arima_model)  
+actual_values <- cocoa_price_ts     
+
+temp <- data.frame(
+  Time = time(cocoa_price_ts),
+  Actual = as.numeric(actual_values),
+  Fitted = as.numeric(fit_values)
+)
+
+rmse = sqrt(mse(temp$Actual, temp$Fitted))
+
+fig = ggplot(temp, aes(x = Time)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Fitted, color = "Fitted")) +
+  scale_color_manual(
+    name = "colour",
+    values = c("Actual" = "green", 
+               "Fitted" = "blue")
+  ) +
+  labs(
+    title = "ARIMA(3,1,3)",
+    subtitle = paste("RMSE:", rmse),
+    x = "Time",
+    y = "Price"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position.inside = c(1,1),
+    plot.title = element_text(hjust = 0.5,
+                              vjust = 1,
+                              size = 14,
+                              face = "bold",
+                              color = "darkblue"),
+    plot.subtitle = element_text(hjust = 0.5,
+                                 vjust = 1,
+                                 size = 12)
+  )
+ggsave("fig_arima.png", plot = fig, width = 6, height = 4, dpi = 100)
+
+prediction_arima = sarima.for(cocoa_price_ts, 4, 3, 1, 3, 0, 0, 0)
+
+prediction = data.frame(Month = future_month_data$month)
+prediction$Actual = future_month_data$Price
+prediction$ARIMA = prediction_arima$pred
+
+# SARIMAX
+ori_var = as.matrix(cocoa_data_month %>% select("TAVG", "PRCP"))
+
+exog_vars = as.matrix(cocoa_future_data[, c("TAVG", "PRCP")])
+
+model_arimax <- Arima(cocoa_price_ts, order = c(3,1,3), seasonal = c(0,0,0), xreg = ori_var)
+
+fit_values <- fitted(model_arimax)  
+actual_values <- cocoa_price_ts     
+
+temp <- data.frame(
+  Time = time(cocoa_price_ts),
+  Actual = as.numeric(actual_values),
+  Fitted = as.numeric(fit_values)
+)
+
+rmse = sqrt(mse(temp$Actual, temp$Fitted))
+
+fig = ggplot(temp, aes(x = Time)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Fitted, color = "Fitted")) +
+  scale_color_manual(
+    name = "colour",
+    values = c("Actual" = "green", 
+               "Fitted" = "blue")
+  ) +
+  labs(
+    title = "ARIMAX(3,1,3)",
+    subtitle = paste("RMSE:", rmse),
+    x = "Time",
+    y = "Price"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position.inside = c(1,1),
+    plot.title = element_text(hjust = 0.5,
+                              vjust = 1,
+                              size = 14,
+                              face = "bold",
+                              color = "darkblue"),
+    plot.subtitle = element_text(hjust = 0.5,
+                                 vjust = 1,
+                                 size = 12)
+  )
+ggsave("fig_arimax.png", plot = fig, width = 6, height = 4, dpi = 100)
+
+
+prediction_arimax = forecast(model_arimax, h = 4, xreg = exog_vars)
+
+prediction$ARIMAX = prediction_arimax$mean
+```
+
+## Regression
+
+### Model
+
+```{r}
+create_lags = function(data, lags = 1:6){
+  for (lag in lags){
+    data[[paste0("lag_",lag)]] <- dplyr::lag(data$LOGP, lag)
+  }
+  return(data)
+}
+
+cocoa_data_lagged = create_lags(cocoa_data_month)
+
+lm_data = cocoa_data_lagged %>%
+  select(month, LOGP, starts_with("lag_"), PRCP, TAVG) %>%
+  drop_na()
+
+train_size = floor(0.8 * nrow(lm_data))
+train_lm = lm_data[1:train_size, ]
+test_lm = lm_data[(train_size):nrow(lm_data),]
+test_date = head(lm_data[(train_size - 1):nrow(lm_data),],-1)
+
+lm_model = lm(LOGP ~ ., data = train_lm %>% select(-month))
+lm_pred_log = predict(lm_model, newdata = test_lm)
+lm_pred_price = exp(lm_pred_log)
+
+lm_results = tibble(
+  Month = test_date$month,
+  Actual = exp(test_date$LOGP),
+  Predicated = lm_pred_price
+)
+
+rmse = sqrt(mse(lm_results$Actual, lm_results$Predicated))
+
+fig = ggplot(lm_results, aes(x = Month)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Predicated, color = "Fitted")) +
+  scale_color_manual(values = c("green", "blue")) +
+  labs(title = "Linear Regression",
+       subtitle = paste("RMSE:", rmse),
+       y = "Price",
+       x = "Time") +
+  theme_minimal() +
+  theme(legend.position.inside = c(0.95, 0.95),
+        plot.title = element_text(
+          hjust = 0.5,
+          vjust = 1,
+          size = 14,
+          face = "bold",
+          color = "darkblue"
+        ),
+        plot.subtitle = element_text(
+          hjust = 0.5,
+          vjust = 1,
+          size = 12
+        )
+        )
+ggsave("fig_lm.png", plot = fig, width = 6, height = 4, dpi = 100)
+```
+
+### Prediction
+
+```{r}
+full_data_lagged = cocoa_data_lagged
+
+lm_data = full_data_lagged %>%
+  select(month, LOGP, starts_with("lag_"), PRCP, TAVG) %>%
+  drop_na()
+
+lm_model_full = lm(LOGP ~ ., data = lm_data %>% select(-month))
+```
+
+```{r}
+forecast_price <- function(model, df, n, future_weather) {
+  last_prices <- as.numeric(df %>% tail(1) %>% select(starts_with("lag_")))
+  
+  predictions <- c()
+  
+  for (i in 1:n) {
+    weather <- as.numeric(future_weather[i, ])
+    
+    new_data <- as.data.frame(t(c(last_prices, weather)))
+    colnames(new_data) <- c(paste0("lag_", 1:6), "PRCP", "TAVG")
+    
+    pred <- predict(model, new_data)
+    predictions <- c(predictions, pred)
+    
+    last_prices <- c(last_prices[-1], pred)
+  }
+  
+  return(predictions)
+}
+
+future_weather <- data.frame(
+  PRCP = future_whether$PRCP,
+  TAVG = future_whether$TAVG
+)
+
+predicted_prices <- forecast_price(lm_model_full, lm_data %>% select(-LOGP), 4, future_weather)
+pure_numbers <- as.numeric(predicted_prices)
+lm_forc_price = exp(pure_numbers)
+
+prediction$Reg = lm_forc_price
+
+lm_forc_data = data.frame(cocoa_future_data$month, lm_forc_price)
+colnames(lm_forc_data) = c("Month", "Price")
+
+lm_forc_data %>% ggplot(aes(x = Month, y = Price)) +
+  geom_line(col = "blue") +
+  geom_line(aes(y = actual_price), col = "red") +
+  labs(title = "Linear Regression Forecast v.s. Actural Prices", 
+       y = "Price", 
+       x = "Date") +
+  theme_minimal()
+```
+
+## XGBOOST
+
+### Model
+
+#### Rolling Windows
+
+```{r, warning=FALSE}
+df <- na.omit(cocoa_data_lagged)
+
+window_size <- 6
+train_ratio <- 0.8
+n_total <- nrow(df)
+n_train <- floor(n_total * train_ratio)
+n_test <- n_total - n_train - window_size
+
+X_train <- matrix(nrow = n_train - window_size, ncol = 8)
+y_train <- numeric(n_train - window_size)
+X_test <- matrix(nrow = n_test, ncol = 8)
+y_test <- numeric(n_test)
+
+for (i in (window_size + 1):n_train) {
+  window_data <- df[(i - window_size):(i - 1), ]
+  X_train[i - window_size, ] <- c(
+    window_data$LOGP,
+    df$PRCP[i],
+    df$TAVG[i]
+  )
+  y_train[i - window_size] <- df$LOGP[i]
+}
+
+for (i in (n_train + 1):(n_total - window_size)) {
+  window_data <- df[(i - window_size):(i - 1), ]
+  X_test[i - n_train, ] <- c(
+    window_data$LOGP,
+    df$PRCP[i],
+    df$TAVG[i]
+  )
+  y_test[i - n_train] <- df$LOGP[i]
+}
+
+colnames(X_train) <- colnames(X_test) <- c(paste0("lag_", 1:6), "PRCP", "TAVG")
+
+params <- list(
+  objective = "reg:squarederror",
+  eta = 0.05,
+  max_depth = 6
+)
+
+model <- xgboost(
+  data = X_train,
+  label = y_train,
+  params = params,
+  nrounds = 200,
+  early_stopping_rounds = 20,
+  verbose = 0
+)
+```
+
+pred
+
+```{r}
+window_size <- 6
+train_ratio <- 0.8
+n_total <- nrow(df)
+n_train <- floor(n_total * train_ratio)
+n_test <- n_total - n_train - window_size
+
+X_train <- matrix(nrow = n_train - window_size, ncol = 8)
+y_train <- numeric(n_train - window_size)
+X_test <- matrix(nrow = n_test, ncol = 8)
+y_test <- numeric(n_test)
+
+for (i in (window_size + 1):n_train) {
+  window_data <- df[(i - window_size):(i - 1), ]
+  X_train[i - window_size, ] <- c(
+    window_data$LOGP,
+    df$PRCP[i],
+    df$TAVG[i]
+  )
+  y_train[i - window_size] <- df$LOGP[i]
+}
+
+test_pred <- numeric(n_test)
+last_lags <- df$LOGP[(n_train - window_size + 1):n_train]
+for (i in 1:n_test) {
+  current_idx <- n_train + i
+  
+  window_data <- df[(current_idx - window_size):(current_idx - 1), ]
+  features <- c(
+    window_data$LOGP,
+    df$PRCP[current_idx],
+    df$TAVG[current_idx]
+  )
+  
+  pred_log <- predict(model, matrix(features, nrow = 1))
+  test_pred[i] <- exp(pred_log)
+  y_test[i] <- df$LOGP[current_idx]
+}
+
+test_rmse <- sqrt(mean((exp(y_test) - test_pred)^2))
+test_mae <- mean(abs(exp(y_test) - test_pred))
+```
+
+```{r}
+results <- data.frame(
+  Month = tail(df$month, n_test),
+  Actual = exp(y_test),
+  Predicted = test_pred)
+
+rmse = sqrt(mse(results$Actual, results$Predicted))
+
+fig = ggplot(results, aes(x = Month)) +
+  geom_line(aes(y = Actual, color = "Actual")) +
+  geom_line(aes(y = Predicted, color = "Predicted")) +
+  scale_color_manual(values = c("Actual" = "green", "Predicted" = "blue")) +
+  labs(title = "XGBoost",
+       x = "Time",
+       y = "Price",
+       subtitle = paste("RMSE:", rmse)) +
+  theme_minimal() +
+  theme(plot.title = element_text(
+    hjust = 0.5,
+    vjust = 1,
+    size = 14,
+    face = "bold",
+    color = "darkblue"),
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      vjust = 1,
+      size = 12
+    ))
+ggsave("fig_xgb.png", plot = fig, width = 6, height = 4, dpi = 100)
+```
+
+### Prediction
+
+#### Rolling Windows
+
+```{r}
+full_train_data <- na.omit(cocoa_data_lagged)
+
+X_train <- as.matrix(full_train_data[, c("lag_1", "lag_2", "lag_3", "lag_4", "lag_5", "lag_6","PRCP", "TAVG")])
+y_train <- full_train_data$LOGP
+
+full_model <- xgboost(
+  data = X_train,
+  label = y_train,
+  nrounds = 200,
+  objective = "reg:squarederror",
+  verbose = 0,
+  eta = 0.05
+)
+
+last_prices <- tail(full_train_data$LOGP, 6)
+
+n_forecast <- nrow(cocoa_future_data)
+
+forecast_dates = cocoa_future_data$month
+forecast_prices <- numeric(n_forecast)
+
+for (i in 1:n_forecast) {
+  current_weather <- cocoa_future_data[i, c("PRCP", "TAVG")]
+  
+  features <- c(last_prices, current_weather$PRCP, current_weather$TAVG)
+  names(features) <- c("lag_1", "lag_2", "lag_3", "lag_4", "lag_5", "lag_6","PRCP", "TAVG")
+  
+  pred_log <- predict(full_model, matrix(features, nrow = 1))
+  forecast_prices[i] <- exp(pred_log)
+  
+  last_prices <- c(last_prices[-1], pred_log)
+}
+
+forecast_results <- data.frame(
+  Date = cocoa_future_data$month,
+  Predicted_Price = forecast_prices
+)
+
+prediction$XGB = forecast_results$Predicted_Price
+
+combined_plot = ggplot() +
+  geom_line(data = forecast_results, aes(x = Date , y = Predicted_Price), color = "red", linetype = "dashed") +
+  geom_line(data = cocoa_future_data, aes(x = month, y = Price), col = "green") +
+  labs(title = "Cocoa Price Forecast", y = "Price", x = "Date") +
+  theme_minimal()
+
+print(combined_plot)
+```
+
+## MSE
+
+```{r}
+colname = c("ARIMA", "ARIMAX", "Regression", "XGBOOST")
+MSE_sarima = mse(actual_price, prediction_arima$pred)
+MSE_sarimax = mse(actual_price, prediction_arimax$mean)
+MSE_reg = mse(actual_price, lm_forc_price)
+MSE_xgb_r = mse(actual_price, forecast_results$Predicted_Price)
+MSE = data.frame(MSE_sarima,MSE_sarimax,MSE_reg,MSE_xgb_r)
+colnames(MSE) = colname
+
+pred_long <- prediction %>%
+  pivot_longer(cols = c(Actual, ARIMA, ARIMAX, Reg, XGB),
+               names_to = "Model",
+               values_to = "Value")
+
+fig = ggplot(pred_long, aes(x = Month, y = Value, color = Model)) +
+  geom_line() +
+  scale_color_manual(values = c(
+    "Actual" = "green",
+    "ARIMA" = "red",
+    "ARIMAX" = "orange",
+    "Reg" = "purple",
+    "XGB" = "blue"
+  )) +
+  geom_point(col = "yellow") +
+  labs(
+    title = "Prediction vs Actual Value",
+    subtitle = "4 months forecast", 
+    x = "Month",
+    y = "Price") +
+  theme_minimal() +
+  theme(legend.position.inside = c(1, 1),
+        legend.justification = c(1, 1),
+        plot.title = element_text(
+          hjust = 0.5,
+          vjust = 1,
+          size = 14,
+          face = "bold",
+          color = "darkblue"
+          ),
+        plot.subtitle = element_text(
+          hjust = 0.5,
+          color = "blue")
+      )
+ggsave("fig_all.png", plot = fig, width = 6, height = 4, dpi = 100)
+
+RMSE = sqrt(MSE)
+
+fig = kable(RMSE, "html", digits = 2, caption = "4 Model Performances in Prediction (RMSE)") %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover"),
+    full_width = FALSE,
+    position = "center",
+  ) %>%
+  row_spec(0, bold = TRUE, color = "white", background = "#3498db")
+```
